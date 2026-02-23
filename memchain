@@ -3,7 +3,7 @@
 # v0.2.0 — 2026-02-23
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 CHAIN_FILE=".memchain.json"
 POLICY_FILE=".memchain-policy"
 
@@ -329,28 +329,178 @@ cmd_help() {
 memchain v$VERSION — tamper-evident hash chains for agent memory
 
 Usage:
-  memchain init [dir]           Initialize a new chain
-  memchain record [dir]         Record current state of tracked files
-  memchain verify [dir]         Verify chain integrity
+  memchain init [dir]            Initialize a new chain
+  memchain record [dir]          Record current state of tracked files
+  memchain verify [dir]          Verify chain integrity
   memchain verify --strict [dir] Verify + fail on file drift (exit 2)
-  memchain status [dir]         Show chain status and file drift
-  memchain log [dir]            Show chain history
-  memchain policy-init [dir]    Create a .memchain-policy template
-  memchain help                 Show this help
+  memchain status [dir]          Show chain status and file drift
+  memchain log [dir]             Show chain history
+  memchain policy-init [dir]     Create a .memchain-policy template
+  memchain anchor [dir]          Push chain head to GitHub Gist (external witness)
+  memchain anchor-verify [dir]   Verify local chain against remote anchor
+  memchain help                  Show this help
 
 Files:
   .memchain.json    Chain data (append-only)
   .memchain-policy  File tracking patterns (optional)
+  .memchain-anchor  Gist ID for external anchoring
 
 EOF
 }
 
+cmd_anchor() {
+  local dir="${1:-.}"
+  local chain="$dir/$CHAIN_FILE"
+  [[ -f "$chain" ]] || die "No chain found at $chain"
+  
+  command -v gh >/dev/null 2>&1 || die "GitHub CLI (gh) required for anchoring. Install: https://cli.github.com"
+  
+  # Get latest entry
+  local anchor_data
+  anchor_data=$(python3 -c "
+import json, os
+with open('$chain') as f:
+    data = json.load(f)
+entries = data.get('entries', [])
+if not entries:
+    print('EMPTY')
+else:
+    e = entries[-1]
+    print(json.dumps({
+        'chain': os.path.abspath('$chain'),
+        'seq': e['seq'],
+        'timestamp': e['timestamp'],
+        'entry_hash': e['entry_hash'],
+        'content_hash': e['content_hash'],
+        'files_count': e['files_count'],
+        'anchored_at': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+        'total_entries': len(entries)
+    }, indent=2))
+")
+  
+  [[ "$anchor_data" == "EMPTY" ]] && die "Chain is empty — nothing to anchor"
+  
+  local anchor_file="$dir/.memchain-anchor"
+  local gist_id=""
+  
+  # Check for existing gist ID
+  if [[ -f "$anchor_file" ]]; then
+    gist_id=$(cat "$anchor_file")
+  fi
+  
+  # Create temp file with anchor content
+  local tmpfile
+  tmpfile=$(mktemp /tmp/memchain-anchor-XXXXXX.json)
+  echo "$anchor_data" > "$tmpfile"
+  
+  if [[ -n "$gist_id" ]]; then
+    # Update existing gist
+    gh gist edit "$gist_id" "$tmpfile" 2>/dev/null || {
+      # Gist might be deleted, create new
+      gist_id=""
+    }
+  fi
+  
+  if [[ -z "$gist_id" ]]; then
+    # Create new gist
+    local gist_url
+    gist_url=$(gh gist create "$tmpfile" --desc "memchain anchor — tamper-evident chain head" --public 2>&1 | grep "gist.github.com")
+    gist_id=$(echo "$gist_url" | grep -oP '[a-f0-9]{20,}' || echo "$gist_url" | awk -F/ '{print $NF}')
+    echo "$gist_id" > "$anchor_file"
+  fi
+  
+  rm -f "$tmpfile"
+  
+  local seq
+  seq=$(echo "$anchor_data" | python3 -c "import json,sys; print(json.load(sys.stdin)['seq'])")
+  
+  echo "✓ Anchored entry #$seq to GitHub Gist"
+  echo "  Gist: https://gist.github.com/$gist_id"
+  echo "  Verify: compare entry_hash in gist vs local chain"
+  
+  if [[ ! -f "$anchor_file.bak" ]]; then
+    echo "  Tip: the gist URL is stored in $anchor_file"
+  fi
+}
+
+cmd_anchor_verify() {
+  local dir="${1:-.}"
+  local chain="$dir/$CHAIN_FILE"
+  local anchor_file="$dir/.memchain-anchor"
+  
+  [[ -f "$chain" ]] || die "No chain found at $chain"
+  [[ -f "$anchor_file" ]] || die "No anchor found. Run: memchain anchor $dir"
+  
+  command -v gh >/dev/null 2>&1 || die "GitHub CLI (gh) required"
+  
+  local gist_id
+  gist_id=$(cat "$anchor_file")
+  
+  # Fetch gist content (--raw may include description header, extract JSON)
+  local remote_raw
+  remote_raw=$(gh gist view "$gist_id" --raw 2>/dev/null) || die "Could not fetch gist $gist_id"
+  
+  local remote_data
+  remote_data=$(echo "$remote_raw" | python3 -c "
+import sys, json
+text = sys.stdin.read()
+# Find the JSON object in the output
+start = text.index('{')
+end = text.rindex('}') + 1
+print(text[start:end])
+")
+  
+  local remote_hash
+  remote_hash=$(echo "$remote_data" | python3 -c "import json,sys; print(json.load(sys.stdin)['entry_hash'])")
+  
+  local remote_seq
+  remote_seq=$(echo "$remote_data" | python3 -c "import json,sys; print(json.load(sys.stdin)['seq'])")
+  
+  # Get local latest
+  local local_hash
+  local_hash=$(python3 -c "
+import json
+with open('$chain') as f:
+    data = json.load(f)
+entries = data.get('entries', [])
+if entries:
+    print(entries[-1]['entry_hash'])
+else:
+    print('EMPTY')
+")
+  
+  local local_seq
+  local_seq=$(python3 -c "
+import json
+with open('$chain') as f:
+    data = json.load(f)
+print(len(data.get('entries', [])) - 1)
+")
+  
+  echo "Remote anchor: entry #$remote_seq — $remote_hash"
+  echo "Local latest:  entry #$local_seq — $local_hash"
+  
+  if [[ "$remote_hash" == "$local_hash" ]]; then
+    echo "✓ Anchor matches local chain head"
+    return 0
+  elif [[ "$local_seq" -gt "$remote_seq" ]]; then
+    echo "⚡ Local chain is ahead of anchor (run 'memchain anchor' to update)"
+    return 0
+  else
+    echo "✗ MISMATCH — local chain does not contain the anchored state"
+    echo "  This could indicate tampering or chain rollback"
+    return 1
+  fi
+}
+
 case "${1:-help}" in
-  init)         cmd_init "${2:-}" ;;
-  record)       cmd_record "${2:-}" ;;
-  verify)       shift; cmd_verify "$@" ;;
-  status)       cmd_status "${2:-}" ;;
-  log)          cmd_log "${2:-}" ;;
-  policy-init)  cmd_policy_init "${2:-}" ;;
-  help|*)       cmd_help ;;
+  init)            cmd_init "${2:-}" ;;
+  record)          cmd_record "${2:-}" ;;
+  verify)          shift; cmd_verify "$@" ;;
+  status)          cmd_status "${2:-}" ;;
+  log)             cmd_log "${2:-}" ;;
+  policy-init)     cmd_policy_init "${2:-}" ;;
+  anchor)          cmd_anchor "${2:-}" ;;
+  anchor-verify)   cmd_anchor_verify "${2:-}" ;;
+  help|*)          cmd_help ;;
 esac
