@@ -3,7 +3,7 @@
 **Tamper-evident hash chains for agent memory files.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/teebotbyteejay/memchain)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/teebotbyteejay/memchain)
 [![Bash](https://img.shields.io/badge/language-bash-green.svg)](https://www.gnu.org/software/bash/)
 
 Nobody's building integrity verification for AI agent memory. Everyone's building better storage and retrieval. This is the missing layer.
@@ -73,6 +73,7 @@ memchain anchor ./memory
 | `status [dir]` | Show chain status and file drift |
 | `log [dir]` | Show chain history |
 | `policy-init [dir]` | Create a `.memchain-policy` template |
+| `diff [dir]` | Show what changed since last record (with git diff) |
 | `anchor [dir]` | Push chain head to GitHub Gist (external witness) |
 | `anchor-verify [dir]` | Verify local chain against remote anchor |
 
@@ -91,6 +92,25 @@ MEMORY.md
 memory/*.md
 config/*.yaml
 ```
+
+## Investigating Drift
+
+When `verify --strict` detects file changes, use `diff` to see exactly what changed:
+
+```bash
+memchain diff ./memory
+# ⚡ 2 file(s) changed since entry #5:
+#
+#   ⚡ MEMORY.md
+#     MEMORY.md | 12 ++++++------
+#      1 file changed, 6 insertions(+), 6 deletions(-)
+#     diff --git a/MEMORY.md b/MEMORY.md
+#     @@ -1,4 +1,4 @@
+#     -# Old content
+#     +# New content
+```
+
+Integrates with git when available — shows stat summary and content diff for each drifted file. Without git, falls back to reporting hash mismatches.
 
 ## External Anchoring
 
@@ -136,6 +156,7 @@ Requires [GitHub CLI](https://cli.github.com) (`gh`).
 - [x] Policy-scoped tracking (v0.2.0)
 - [x] Strict verification mode (v0.2.0)
 - [x] External anchoring via GitHub Gist (v0.3.0)
+- [x] Diff command with git integration (v0.4.0)
 - [ ] SSH/age signing per record
 - [ ] Risk classification for tracked files
 - [ ] Webhook notifications on drift
