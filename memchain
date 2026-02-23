@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# memchain — tamper-evident hash chains for agent memory files
+# v0.1.0 — 2026-02-23
+set -euo pipefail
+
+VERSION="0.1.0"
+CHAIN_FILE=".memchain.json"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# portable sha256
+sha256() { sha256sum | cut -d' ' -f1; }
+
+cmd_init() {
+  local dir="${1:-.}"
+  [[ -d "$dir" ]] || die "Directory '$dir' does not exist"
+  local chain="$dir/$CHAIN_FILE"
+  [[ -f "$chain" ]] && die "Chain already exists at $chain"
+  
+  cat > "$chain" <<EOF
+{
+  "version": 1,
+  "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "entries": []
+}
+EOF
+  echo "✓ Initialized memchain at $chain"
+}
+
+cmd_record() {
+  local dir="${1:-.}"
+  local chain="$dir/$CHAIN_FILE"
+  [[ -f "$chain" ]] || die "No chain found. Run: memchain init $dir"
+
+  # collect hashes of all .md files
+  local file_hashes=""
+  local combined=""
+  local count=0
+  
+  while IFS= read -r -d '' f; do
+    local rel="${f#$dir/}"
+    [[ "$rel" == "$CHAIN_FILE" ]] && continue
+    local h
+    h=$(sha256 < "$f")
+    if [[ $count -gt 0 ]]; then
+      file_hashes="$file_hashes,"
+    fi
+    file_hashes="$file_hashes
+      \"$rel\": \"sha256:$h\""
+    combined="${combined}${rel}:${h}\n"
+    count=$((count + 1))
+  done < <(find "$dir" -maxdepth 2 -name '*.md' -not -name "$CHAIN_FILE" -print0 | sort -z)
+
+  [[ $count -eq 0 ]] && die "No .md files found in $dir"
+
+  # content hash = hash of all file hashes combined
+  local content_hash
+  content_hash=$(printf "$combined" | sha256)
+
+  # get previous entry hash
+  local prev_hash
+  prev_hash=$(python3 -c "
+import json, sys
+with open('$chain') as f:
+    data = json.load(f)
+entries = data.get('entries', [])
+if entries:
+    print(entries[-1]['entry_hash'])
+else:
+    print('null')
+")
+
+  local seq
+  seq=$(python3 -c "
+import json
+with open('$chain') as f:
+    data = json.load(f)
+print(len(data.get('entries', [])))
+")
+
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # entry hash = hash of (seq + timestamp + content_hash + prev_hash)
+  local entry_hash
+  entry_hash=$(printf "%s|%s|%s|%s" "$seq" "$ts" "sha256:$content_hash" "$prev_hash" | sha256)
+
+  # append entry using python for safe JSON manipulation
+  python3 -c "
+import json
+with open('$chain') as f:
+    data = json.load(f)
+
+entry = {
+    'seq': $seq,
+    'timestamp': '$ts',
+    'files_count': $count,
+    'files': {${file_hashes}
+    },
+    'content_hash': 'sha256:$content_hash',
+    'prev_hash': '$prev_hash' if '$prev_hash' != 'null' else None,
+    'entry_hash': 'sha256:$entry_hash'
+}
+
+data['entries'].append(entry)
+
+with open('$chain', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+  echo "✓ Recorded entry #$seq — $count files, hash: sha256:${entry_hash:0:16}..."
+}
+
+cmd_verify() {
+  local dir="${1:-.}"
+  local chain="$dir/$CHAIN_FILE"
+  [[ -f "$chain" ]] || die "No chain found at $chain"
+
+  python3 -c "
+import json, hashlib, sys, os
+
+def sha256(data):
+    return hashlib.sha256(data.encode()).hexdigest()
+
+with open('$chain') as f:
+    data = json.load(f)
+
+entries = data.get('entries', [])
+if not entries:
+    print('⚠ Chain is empty — nothing to verify')
+    sys.exit(0)
+
+errors = 0
+for i, entry in enumerate(entries):
+    # verify chain linkage
+    expected_prev = entries[i-1]['entry_hash'] if i > 0 else None
+    if entry['prev_hash'] != expected_prev:
+        print(f'✗ Entry #{entry[\"seq\"]}: broken chain link')
+        print(f'  expected prev: {expected_prev}')
+        print(f'  got:           {entry[\"prev_hash\"]}')
+        errors += 1
+        continue
+
+    # verify entry hash
+    prev_str = entry['prev_hash'] if entry['prev_hash'] else 'null'
+    recomputed = sha256(f'{entry[\"seq\"]}|{entry[\"timestamp\"]}|{entry[\"content_hash\"]}|{prev_str}')
+    if entry['entry_hash'] != f'sha256:{recomputed}':
+        print(f'✗ Entry #{entry[\"seq\"]}: entry hash mismatch')
+        errors += 1
+        continue
+
+    # verify current file hashes if files still exist
+    file_changes = 0
+    for rel_path, stored_hash in entry['files'].items():
+        full_path = os.path.join('$dir', rel_path)
+        if os.path.exists(full_path):
+            with open(full_path, 'rb') as ff:
+                current = 'sha256:' + hashlib.sha256(ff.read()).hexdigest()
+            if current != stored_hash:
+                file_changes += 1
+
+    status = '✓' if file_changes == 0 else f'⚡ ({file_changes} files changed since)'
+    print(f'✓ Entry #{entry[\"seq\"]} [{entry[\"timestamp\"]}] — chain valid {status}')
+
+if errors:
+    print(f'\n✗ CHAIN BROKEN — {errors} error(s) found')
+    sys.exit(1)
+else:
+    print(f'\n✓ Chain intact — {len(entries)} entries verified')
+"
+}
+
+cmd_log() {
+  local dir="${1:-.}"
+  local chain="$dir/$CHAIN_FILE"
+  [[ -f "$chain" ]] || die "No chain found at $chain"
+
+  python3 -c "
+import json
+with open('$chain') as f:
+    data = json.load(f)
+
+entries = data.get('entries', [])
+if not entries:
+    print('(empty chain)')
+else:
+    for e in entries:
+        h = e['entry_hash'][:23] + '...'
+        print(f'#{e[\"seq\"]:03d}  {e[\"timestamp\"]}  {e[\"files_count\"]} files  {h}')
+"
+}
+
+cmd_help() {
+  cat <<EOF
+memchain v$VERSION — tamper-evident hash chains for agent memory
+
+Usage:
+  memchain init [dir]      Initialize a new chain
+  memchain record [dir]    Record current state of all .md files
+  memchain verify [dir]    Verify chain integrity
+  memchain log [dir]       Show chain history
+  memchain help            Show this help
+
+EOF
+}
+
+case "${1:-help}" in
+  init)    cmd_init "${2:-}" ;;
+  record)  cmd_record "${2:-}" ;;
+  verify)  cmd_verify "${2:-}" ;;
+  log)     cmd_log "${2:-}" ;;
+  help|*)  cmd_help ;;
+esac
