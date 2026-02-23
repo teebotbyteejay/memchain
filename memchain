@@ -1,15 +1,39 @@
 #!/usr/bin/env bash
 # memchain — tamper-evident hash chains for agent memory files
-# v0.1.0 — 2026-02-23
+# v0.2.0 — 2026-02-23
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CHAIN_FILE=".memchain.json"
+POLICY_FILE=".memchain-policy"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # portable sha256
 sha256() { sha256sum | cut -d' ' -f1; }
+
+# find files to track based on policy or default (*.md)
+find_tracked_files() {
+  local dir="$1"
+  local policy="$dir/$POLICY_FILE"
+  
+  if [[ -f "$policy" ]]; then
+    # policy file: one glob pattern per line, # comments, empty lines ignored
+    while IFS= read -r line; do
+      line="${line%%#*}"          # strip comments
+      line="${line##*( )}"       # trim leading
+      line="${line%%*( )}"       # trim trailing
+      [[ -z "$line" ]] && continue
+      # expand glob relative to dir
+      local found
+      found=$(find "$dir" -maxdepth 3 -path "$dir/$line" -print0 2>/dev/null | sort -z | tr '\0' '\n') || true
+      [[ -n "$found" ]] && echo "$found"
+    done < "$policy"
+  else
+    # default: all .md files within 2 levels
+    find "$dir" -maxdepth 2 -name '*.md' -not -name "$CHAIN_FILE" | sort
+  fi
+}
 
 cmd_init() {
   local dir="${1:-.}"
@@ -19,12 +43,40 @@ cmd_init() {
   
   cat > "$chain" <<EOF
 {
-  "version": 1,
+  "version": 2,
   "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "entries": []
 }
 EOF
   echo "✓ Initialized memchain at $chain"
+  
+  # hint about policy
+  if [[ ! -f "$dir/$POLICY_FILE" ]]; then
+    echo "  Tip: create $dir/$POLICY_FILE to control which files are tracked"
+    echo "  (defaults to all .md files)"
+  fi
+}
+
+cmd_policy_init() {
+  local dir="${1:-.}"
+  local policy="$dir/$POLICY_FILE"
+  [[ -f "$policy" ]] && die "Policy already exists at $policy"
+  
+  cat > "$policy" <<'EOF'
+# .memchain-policy — which files to track
+# One glob pattern per line. Comments (#) and blank lines ignored.
+# Patterns are relative to the chain directory.
+
+# Track all markdown files (default behavior)
+*.md
+memory/*.md
+
+# Examples:
+# SOUL.md          # track a specific critical file
+# config/*.yaml    # track config files
+# *.json           # track JSON files
+EOF
+  echo "✓ Created policy at $policy"
 }
 
 cmd_record() {
@@ -32,14 +84,17 @@ cmd_record() {
   local chain="$dir/$CHAIN_FILE"
   [[ -f "$chain" ]] || die "No chain found. Run: memchain init $dir"
 
-  # collect hashes of all .md files
+  # collect hashes of tracked files
   local file_hashes=""
   local combined=""
   local count=0
   
-  while IFS= read -r -d '' f; do
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ "$f" == *"$CHAIN_FILE"* ]] && continue
+    [[ "$f" == *"$POLICY_FILE"* ]] && continue
+    [[ -f "$f" ]] || continue
     local rel="${f#$dir/}"
-    [[ "$rel" == "$CHAIN_FILE" ]] && continue
     local h
     h=$(sha256 < "$f")
     if [[ $count -gt 0 ]]; then
@@ -49,9 +104,9 @@ cmd_record() {
       \"$rel\": \"sha256:$h\""
     combined="${combined}${rel}:${h}\n"
     count=$((count + 1))
-  done < <(find "$dir" -maxdepth 2 -name '*.md' -not -name "$CHAIN_FILE" -print0 | sort -z)
+  done < <(find_tracked_files "$dir")
 
-  [[ $count -eq 0 ]] && die "No .md files found in $dir"
+  [[ $count -eq 0 ]] && die "No tracked files found in $dir"
 
   # content hash = hash of all file hashes combined
   local content_hash
@@ -103,6 +158,7 @@ entry = {
 }
 
 data['entries'].append(entry)
+data['version'] = 2
 
 with open('$chain', 'w') as f:
     json.dump(data, f, indent=2)
@@ -112,11 +168,29 @@ with open('$chain', 'w') as f:
 
 cmd_verify() {
   local dir="${1:-.}"
+  local strict=0
+  
+  # parse flags
+  for arg in "$@"; do
+    case "$arg" in
+      --strict) strict=1 ;;
+    esac
+  done
+  
+  # first non-flag arg is dir
+  for arg in "$@"; do
+    [[ "$arg" == --* ]] && continue
+    dir="$arg"
+    break
+  done
+  
   local chain="$dir/$CHAIN_FILE"
   [[ -f "$chain" ]] || die "No chain found at $chain"
 
   python3 -c "
 import json, hashlib, sys, os
+
+strict = $strict
 
 def sha256(data):
     return hashlib.sha256(data.encode()).hexdigest()
@@ -130,6 +204,7 @@ if not entries:
     sys.exit(0)
 
 errors = 0
+drift_files = 0
 for i, entry in enumerate(entries):
     # verify chain linkage
     expected_prev = entries[i-1]['entry_hash'] if i > 0 else None
@@ -148,8 +223,10 @@ for i, entry in enumerate(entries):
         errors += 1
         continue
 
-    # verify current file hashes if files still exist
+    # verify current file hashes (only for latest entry)
+    is_latest = (i == len(entries) - 1)
     file_changes = 0
+    changed_names = []
     for rel_path, stored_hash in entry['files'].items():
         full_path = os.path.join('$dir', rel_path)
         if os.path.exists(full_path):
@@ -157,15 +234,32 @@ for i, entry in enumerate(entries):
                 current = 'sha256:' + hashlib.sha256(ff.read()).hexdigest()
             if current != stored_hash:
                 file_changes += 1
+                if is_latest:
+                    changed_names.append(rel_path)
+        elif is_latest:
+            file_changes += 1
+            changed_names.append(f'{rel_path} (missing)')
 
-    status = '✓' if file_changes == 0 else f'⚡ ({file_changes} files changed since)'
-    print(f'✓ Entry #{entry[\"seq\"]} [{entry[\"timestamp\"]}] — chain valid {status}')
+    if is_latest and file_changes > 0:
+        drift_files = file_changes
+        status = f'⚡ {file_changes} file(s) changed since last record'
+        print(f'✓ Entry #{entry[\"seq\"]} [{entry[\"timestamp\"]}] — chain valid, {status}')
+        if strict:
+            for cn in changed_names:
+                print(f'  ⚡ {cn}')
+    else:
+        print(f'✓ Entry #{entry[\"seq\"]} [{entry[\"timestamp\"]}] — chain valid')
 
 if errors:
     print(f'\n✗ CHAIN BROKEN — {errors} error(s) found')
     sys.exit(1)
+elif strict and drift_files > 0:
+    print(f'\n⚠ DRIFT DETECTED — {drift_files} file(s) modified since last record')
+    print('  Run \"memchain record\" to accept current state, or investigate changes.')
+    sys.exit(2)
 else:
     print(f'\n✓ Chain intact — {len(entries)} entries verified')
+    sys.exit(0)
 "
 }
 
@@ -189,24 +283,74 @@ else:
 "
 }
 
+cmd_status() {
+  local dir="${1:-.}"
+  local chain="$dir/$CHAIN_FILE"
+  [[ -f "$chain" ]] || die "No chain found at $chain"
+  
+  python3 -c "
+import json, hashlib, os
+
+with open('$chain') as f:
+    data = json.load(f)
+
+entries = data.get('entries', [])
+policy_path = '$dir/$POLICY_FILE'
+has_policy = os.path.exists(policy_path)
+
+print(f'memchain v$VERSION')
+print(f'Chain: $chain ({len(entries)} entries)')
+print(f'Policy: {policy_path if has_policy else \"(default: *.md)\"}')
+
+if entries:
+    latest = entries[-1]
+    print(f'Latest: #{latest[\"seq\"]} at {latest[\"timestamp\"]} ({latest[\"files_count\"]} files)')
+    
+    changed = 0
+    for rel_path, stored_hash in latest['files'].items():
+        full_path = os.path.join('$dir', rel_path)
+        if os.path.exists(full_path):
+            with open(full_path, 'rb') as ff:
+                current = 'sha256:' + hashlib.sha256(ff.read()).hexdigest()
+            if current != stored_hash:
+                changed += 1
+                print(f'  ⚡ {rel_path} (modified)')
+        else:
+            changed += 1
+            print(f'  ✗ {rel_path} (missing)')
+    
+    if changed == 0:
+        print('  All files match last record ✓')
+"
+}
+
 cmd_help() {
   cat <<EOF
 memchain v$VERSION — tamper-evident hash chains for agent memory
 
 Usage:
-  memchain init [dir]      Initialize a new chain
-  memchain record [dir]    Record current state of all .md files
-  memchain verify [dir]    Verify chain integrity
-  memchain log [dir]       Show chain history
-  memchain help            Show this help
+  memchain init [dir]           Initialize a new chain
+  memchain record [dir]         Record current state of tracked files
+  memchain verify [dir]         Verify chain integrity
+  memchain verify --strict [dir] Verify + fail on file drift (exit 2)
+  memchain status [dir]         Show chain status and file drift
+  memchain log [dir]            Show chain history
+  memchain policy-init [dir]    Create a .memchain-policy template
+  memchain help                 Show this help
+
+Files:
+  .memchain.json    Chain data (append-only)
+  .memchain-policy  File tracking patterns (optional)
 
 EOF
 }
 
 case "${1:-help}" in
-  init)    cmd_init "${2:-}" ;;
-  record)  cmd_record "${2:-}" ;;
-  verify)  cmd_verify "${2:-}" ;;
-  log)     cmd_log "${2:-}" ;;
-  help|*)  cmd_help ;;
+  init)         cmd_init "${2:-}" ;;
+  record)       cmd_record "${2:-}" ;;
+  verify)       shift; cmd_verify "$@" ;;
+  status)       cmd_status "${2:-}" ;;
+  log)          cmd_log "${2:-}" ;;
+  policy-init)  cmd_policy_init "${2:-}" ;;
+  help|*)       cmd_help ;;
 esac
