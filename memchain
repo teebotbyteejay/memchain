@@ -3,7 +3,7 @@
 # v0.2.0 — 2026-02-23
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 CHAIN_FILE=".memchain.json"
 POLICY_FILE=".memchain-policy"
 
@@ -335,6 +335,7 @@ Usage:
   memchain verify --strict [dir] Verify + fail on file drift (exit 2)
   memchain status [dir]          Show chain status and file drift
   memchain log [dir]             Show chain history
+  memchain diff [dir]            Show what changed since last record (with git diff)
   memchain policy-init [dir]     Create a .memchain-policy template
   memchain anchor [dir]          Push chain head to GitHub Gist (external witness)
   memchain anchor-verify [dir]   Verify local chain against remote anchor
@@ -493,12 +494,84 @@ print(len(data.get('entries', [])) - 1)
   fi
 }
 
+cmd_diff() {
+  local dir="${1:-.}"
+  local chain="$dir/$CHAIN_FILE"
+  [[ -f "$chain" ]] || die "No chain found at $chain"
+
+  python3 -c "
+import json, hashlib, os, subprocess, sys
+
+with open('$chain') as f:
+    data = json.load(f)
+
+entries = data.get('entries', [])
+if not entries:
+    print('Chain is empty')
+    sys.exit(0)
+
+latest = entries[-1]
+changed = []
+
+for rel_path, stored_hash in latest['files'].items():
+    full_path = os.path.join('$dir', rel_path)
+    if os.path.exists(full_path):
+        with open(full_path, 'rb') as ff:
+            current = 'sha256:' + hashlib.sha256(ff.read()).hexdigest()
+        if current != stored_hash:
+            changed.append(rel_path)
+    else:
+        changed.append(rel_path + ' (missing)')
+
+if not changed:
+    print('No drift — all files match last record ✓')
+    sys.exit(0)
+
+print(f'⚡ {len(changed)} file(s) changed since entry #{latest[\"seq\"]}:\n')
+
+for rel in changed:
+    if rel.endswith('(missing)'):
+        print(f'  ✗ {rel}')
+        continue
+    
+    full_path = os.path.join('$dir', rel)
+    print(f'  ⚡ {rel}')
+    
+    # Try git diff if available
+    try:
+        git_root = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+            capture_output=True, text=True, cwd='$dir').stdout.strip()
+        if git_root:
+            diff = subprocess.run(['git', 'diff', '--stat', full_path],
+                capture_output=True, text=True, cwd=git_root)
+            if diff.stdout.strip():
+                for line in diff.stdout.strip().split('\n'):
+                    print(f'    {line}')
+            
+            # Show abbreviated content diff (first 20 lines)
+            cdiff = subprocess.run(['git', 'diff', '-U3', '--no-color', full_path],
+                capture_output=True, text=True, cwd=git_root)
+            if cdiff.stdout.strip():
+                lines = cdiff.stdout.strip().split('\n')
+                for line in lines[:25]:
+                    print(f'    {line}')
+                if len(lines) > 25:
+                    print(f'    ... ({len(lines) - 25} more lines)')
+            else:
+                print('    (no git diff — changes may be staged or file is untracked)')
+    except Exception:
+        print('    (git not available for diff)')
+    print()
+"
+}
+
 case "${1:-help}" in
   init)            cmd_init "${2:-}" ;;
   record)          cmd_record "${2:-}" ;;
   verify)          shift; cmd_verify "$@" ;;
   status)          cmd_status "${2:-}" ;;
   log)             cmd_log "${2:-}" ;;
+  diff)            cmd_diff "${2:-}" ;;
   policy-init)     cmd_policy_init "${2:-}" ;;
   anchor)          cmd_anchor "${2:-}" ;;
   anchor-verify)   cmd_anchor_verify "${2:-}" ;;
