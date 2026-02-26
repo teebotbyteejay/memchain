@@ -167,21 +167,15 @@ with open('$chain', 'w') as f:
 }
 
 cmd_verify() {
-  local dir="${1:-.}"
+  local dir="."
   local strict=0
   
-  # parse flags
+  # parse flags and find dir (first non-flag arg)
   for arg in "$@"; do
     case "$arg" in
       --strict) strict=1 ;;
+      *) dir="$arg" ;;
     esac
-  done
-  
-  # first non-flag arg is dir
-  for arg in "$@"; do
-    [[ "$arg" == --* ]] && continue
-    dir="$arg"
-    break
   done
   
   local chain="$dir/$CHAIN_FILE"
